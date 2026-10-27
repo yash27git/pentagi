@@ -2,506 +2,403 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
-	"os/exec"
-	"reflect"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"testing"
+	"os/signal"
+	"strconv"
+	"syscall"
 	"time"
+	// The runtime image is alpine without the tzdata package, so IANA names the
+	// dashboard sends would not resolve unless the binary carries the database.
+	_ "time/tzdata"
+
+	"pentagi/migrations"
+	"pentagi/pkg/config"
+	"pentagi/pkg/controller"
+	"pentagi/pkg/database"
+	"pentagi/pkg/docker"
+	"pentagi/pkg/graph/subscriptions"
+	obs "pentagi/pkg/observability"
+	"pentagi/pkg/observability/profiling"
+	"pentagi/pkg/providers"
+	router "pentagi/pkg/server"
+	"pentagi/pkg/server/update"
+	"pentagi/pkg/version"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/lib/pq"
+	"github.com/pressly/goose/v3"
+	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
 )
 
+// HTTP shutdown and telemetry drain run on fresh contexts: the signal context
+// is already cancelled by the time either starts.
 const (
-	testWaitTimeout     = 10 * time.Second
-	testShutdownTimeout = 15 * time.Second
-	testDrainTimeout    = 5 * time.Second
+	httpShutdownTimeout   = 15 * time.Second
+	telemetryDrainTimeout = 5 * time.Second
 )
 
-var errSimulatedServerFailure = errors.New("accept tcp: too many open files")
-
-type shutdownRecorder struct {
-	mu     sync.Mutex
-	events []string
+func main() {
+	// os.Exit skips deferred calls, so every deferred cleanup lives in
+	// runApplication and the exit status is only decided once it has returned.
+	os.Exit(runApplication())
 }
 
-func (r *shutdownRecorder) add(event string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func runApplication() int {
+	// Setup graceful shutdown context with signal handling
+	ctx, cancelOnSignal := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+		syscall.SIGQUIT,
+	)
+	defer cancelOnSignal()
 
-	r.events = append(r.events, event)
-}
-
-func (r *shutdownRecorder) snapshot() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return append([]string(nil), r.events...)
-}
-
-func requireEvents(t *testing.T, got, want []string) {
-	t.Helper()
-
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("events = %v, want %v", got, want)
-	}
-}
-
-type ctxSnapshot struct {
-	err         error
-	deadline    time.Time
-	hasDeadline bool
-	taken       time.Time
-}
-
-// Snapshot at call time: production code cancels these contexts on return.
-func snapshotCtx(ctx context.Context) ctxSnapshot {
-	deadline, ok := ctx.Deadline()
-
-	return ctxSnapshot{err: ctx.Err(), deadline: deadline, hasDeadline: ok, taken: time.Now()}
-}
-
-func (c ctxSnapshot) requireFresh(t *testing.T, name string, limit time.Duration) {
-	t.Helper()
-
-	if c.err != nil {
-		t.Errorf("%s context was already done: %v", name, c.err)
-	}
-	if !c.hasDeadline {
-		t.Errorf("%s context has no deadline", name)
-		return
-	}
-	if remaining := c.deadline.Sub(c.taken); remaining <= 0 || remaining > limit {
-		t.Errorf("%s deadline is %v away, want within (0, %v]", name, remaining, limit)
-	}
-}
-
-type stubHTTPServer struct {
-	shutdownFn func(ctx context.Context) error
-	closeFn    func() error
-}
-
-func (s *stubHTTPServer) Shutdown(ctx context.Context) error { return s.shutdownFn(ctx) }
-func (s *stubHTTPServer) Close() error                       { return s.closeFn() }
-
-func newGracefulStub(emit func(string)) (srv *stubHTTPServer, serve func() error, shutdownCtx *ctxSnapshot) {
-	stopped := make(chan struct{})
-	var once sync.Once
-	stop := func() { once.Do(func() { close(stopped) }) }
-
-	shutdownCtx = &ctxSnapshot{}
-	srv = &stubHTTPServer{
-		shutdownFn: func(ctx context.Context) error {
-			*shutdownCtx = snapshotCtx(ctx)
-			emit("shutdown")
-			stop()
-			return nil
-		},
-		closeFn: func() error {
-			emit("close")
-			stop()
-			return nil
-		},
-	}
-	serve = func() error {
-		<-stopped
-		return http.ErrServerClosed
+	// Before anything is logged or started. `-info` describes this server and
+	// exits, and its output is a JSON document on stdout — a greeting printed
+	// first would be the first thing a reader has to strip back out.
+	if wantsInfo(os.Args[1:]) {
+		return runInfo(ctx)
 	}
 
-	return srv, serve, shutdownCtx
-}
+	logrus.Infof("Starting PentAGI %s", version.GetBinaryVersion())
 
-type spyHTTPServer struct {
-	*http.Server
+	cfg, err := config.NewConfig()
+	if err != nil {
+		// Fatal rather than Error: cfg is nil on failure, so continuing would
+		// panic anyway, and an invalid TENANT_ID must never boot into a namespace
+		// it did not intend to own.
+		logrus.WithError(err).Fatal("Unable to load config")
+	}
 
-	shutdownStarted chan struct{}
-	startOnce       sync.Once
-	closeCalls      atomic.Int32
-}
+	// Configure logrus log level based on DEBUG env variable
+	if cfg.Debug {
+		logrus.SetLevel(logrus.DebugLevel)
+		logrus.Debug("Debug logging enabled")
+	} else {
+		logrus.SetLevel(logrus.InfoLevel)
+	}
 
-func (s *spyHTTPServer) Shutdown(ctx context.Context) error {
-	s.startOnce.Do(func() { close(s.shutdownStarted) })
-	return s.Server.Shutdown(ctx)
-}
+	// Record the identity of this instance for the record: which tenant namespace
+	// it owns and which data directory it writes to. Both are operator-supplied
+	// and must differ between instances that share a host; having them in the
+	// startup log makes an accidental overlap obvious after the fact.
+	logrus.WithFields(logrus.Fields{
+		"tenant_id":       cfg.TenantID,
+		"data_dir":        cfg.DataDir,
+		"schema":          cfg.SchemaName(),
+		"installation_id": cfg.InstallationID,
+	}).Info("Instance identity")
 
-func (s *spyHTTPServer) Close() error {
-	s.closeCalls.Add(1)
-	return s.Server.Close()
-}
+	// Telemetry is optional — degrade to a no-op observer on init failure so an
+	// unreachable collector can't take the app down.
+	lfclient, err := obs.NewLangfuseClient(ctx, cfg)
+	if err != nil && !errors.Is(err, obs.ErrNotConfigured) {
+		logrus.WithError(err).Warn("langfuse telemetry disabled: client init failed")
+		lfclient = nil
+	}
 
-type blockedHandler struct {
-	entered     chan struct{}
-	release     chan struct{}
-	enterOnce   sync.Once
-	releaseOnce sync.Once
-}
+	otelclient, err := obs.NewTelemetryClient(ctx, cfg)
+	if err != nil && !errors.Is(err, obs.ErrNotConfigured) {
+		logrus.WithError(err).Warn("opentelemetry disabled: client init failed")
+		otelclient = nil
+	}
 
-func (h *blockedHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	h.enterOnce.Do(func() { close(h.entered) })
-	<-h.release
-	_, _ = io.WriteString(w, "done")
-}
+	obs.InitObserver(ctx, lfclient, otelclient, []logrus.Level{
+		logrus.DebugLevel,
+		logrus.InfoLevel,
+		logrus.WarnLevel,
+		logrus.ErrorLevel,
+	})
 
-func (h *blockedHandler) unblock() { h.releaseOnce.Do(func() { close(h.release) }) }
+	_ = obs.Observer.StartProcessMetricCollect(attribute.String("component", "server"))
+	_ = obs.Observer.StartGoRuntimeMetricCollect(attribute.String("component", "server"))
 
-func startBlockedServer(t *testing.T) (spy *spyHTTPServer, serve func() error, h *blockedHandler, url string) {
-	t.Helper()
+	// Create this tenant's schema and repoint DATABASE_URL at it before any
+	// consumer reads the DSN. No-op when TENANT_ID is empty.
+	if err := database.EnsureTenantSchema(ctx, cfg); err != nil {
+		logrus.WithError(err).Fatal("Tenant schema initialization failed")
+	}
 
-	h = &blockedHandler{entered: make(chan struct{}), release: make(chan struct{})}
-	ts := httptest.NewUnstartedServer(h)
+	boundedURL, err := database.WithStatementTimeout(cfg.DatabaseURL, database.StatementTimeout)
+	if err != nil {
+		logrus.WithError(err).Fatal("Unable to bound database statements")
+	}
 
-	t.Cleanup(ts.Close)
-	t.Cleanup(h.unblock)
+	db, err := sql.Open("postgres", boundedURL)
+	if err != nil {
+		logrus.WithError(err).Fatal("Unable to open database")
+	}
 
-	spy = &spyHTTPServer{Server: ts.Config, shutdownStarted: make(chan struct{})}
-	serve = func() error { return ts.Config.Serve(ts.Listener) }
+	db.SetMaxOpenConns(cfg.DBMaxOpenConns)
+	db.SetMaxIdleConns(cfg.DBMaxIdleConns)
+	db.SetConnMaxLifetime(time.Hour)
 
-	return spy, serve, h, "http://" + ts.Listener.Addr().String()
-}
-
-type requestResult struct {
-	status int
-	body   string
-	err    error
-}
-
-func startRequest(url string) <-chan requestResult {
-	result := make(chan requestResult, 1)
-
-	go func() {
-		client := &http.Client{
-			Timeout:   testWaitTimeout,
-			Transport: &http.Transport{DisableKeepAlives: true},
+	// One pool shared by sqlc and GORM, closed here exactly once. Deferred, so
+	// it runs only after the HTTP server has stopped (and after the pgxpool
+	// defer below, which was registered later).
+	defer func() {
+		if err := db.Close(); err != nil {
+			logrus.WithError(err).Warn("failed to close the database connection pool")
 		}
-
-		resp, err := client.Get(url)
-		if err != nil {
-			result <- requestResult{err: err}
-			return
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		result <- requestResult{status: resp.StatusCode, body: string(body), err: err}
 	}()
 
-	return result
-}
-
-func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
-	t.Helper()
-
-	select {
-	case <-ch:
-	case <-time.After(testWaitTimeout):
-		t.Fatalf("timed out waiting for %s", what)
-	}
-}
-
-func waitError(t *testing.T, ch <-chan error, what string) error {
-	t.Helper()
-
-	select {
-	case err := <-ch:
-		return err
-	case <-time.After(testWaitTimeout):
-		t.Fatalf("timed out waiting for %s", what)
-		return nil
-	}
-}
-
-func waitResult(t *testing.T, ch <-chan requestResult, what string) requestResult {
-	t.Helper()
-
-	select {
-	case res := <-ch:
-		return res
-	case <-time.After(testWaitTimeout):
-		t.Fatalf("timed out waiting for %s", what)
-		return requestResult{}
-	}
-}
-
-func TestMain_Timeouts_MatchContract(t *testing.T) {
-	shutdown, drain := httpShutdownTimeout, telemetryDrainTimeout
-
-	if shutdown != 15*time.Second {
-		t.Errorf("httpShutdownTimeout = %v, want 15s", shutdown)
-	}
-	if drain != 5*time.Second {
-		t.Errorf("telemetryDrainTimeout = %v, want 5s", drain)
-	}
-}
-
-func TestMain_SuperviseHTTPServer_ActiveRequestCompletes(t *testing.T) {
-	spy, serve, handler, url := startBlockedServer(t)
-
-	ctx, sendSignal := context.WithCancel(context.Background())
-	defer sendSignal()
-
-	done := make(chan error, 1)
-	go func() { done <- superviseHTTPServer(ctx, spy, serve, testShutdownTimeout) }()
-
-	response := startRequest(url)
-	waitClosed(t, handler.entered, "the request to reach the handler")
-
-	sendSignal()
-	waitClosed(t, spy.shutdownStarted, "Shutdown to be called")
-
-	select {
-	case err := <-done:
-		t.Fatalf("shutdown returned while a request was in flight: %v", err)
-	default:
+	if err := database.VerifySearchPath(ctx, db, cfg); err != nil {
+		logrus.WithError(err).Fatal("Tenant schema verification failed")
 	}
 
-	handler.unblock()
+	queries := database.New(db)
 
-	if err := waitError(t, done, "graceful shutdown to finish"); err != nil {
-		t.Fatalf("graceful shutdown failed: %v", err)
-	}
-
-	res := waitResult(t, response, "the in-flight response")
-	if res.err != nil || res.status != http.StatusOK || res.body != "done" {
-		t.Fatalf("in-flight request = (status %d, body %q, err %v), want it to complete normally",
-			res.status, res.body, res.err)
-	}
-
-	if n := spy.closeCalls.Load(); n != 0 {
-		t.Errorf("Close called %d times after a successful graceful shutdown, want 0", n)
-	}
-}
-
-func TestMain_SuperviseHTTPServer_DeadlineExpiryForcesClose(t *testing.T) {
-	spy, serve, handler, url := startBlockedServer(t)
-
-	ctx, sendSignal := context.WithCancel(context.Background())
-	defer sendSignal()
-
-	done := make(chan error, 1)
-	go func() { done <- superviseHTTPServer(ctx, spy, serve, 100*time.Millisecond) }()
-
-	response := startRequest(url)
-	waitClosed(t, handler.entered, "the request to reach the handler")
-
-	sendSignal()
-
-	err := waitError(t, done, "shutdown to give up")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want it to report context.DeadlineExceeded", err)
-	}
-
-	if n := spy.closeCalls.Load(); n != 1 {
-		t.Errorf("Close called %d times, want exactly 1 forced close", n)
-	}
-
-	if res := waitResult(t, response, "the stuck request to be cut"); res.err == nil {
-		t.Errorf("stuck request finished with status %d, want its connection closed", res.status)
-	}
-}
-
-func TestMain_ShutdownHTTPServer_ForceCloseErrorIsReported(t *testing.T) {
-	closeErr := errors.New("close failed")
-	srv := &stubHTTPServer{
-		shutdownFn: func(context.Context) error { return context.DeadlineExceeded },
-		closeFn:    func() error { return closeErr },
-	}
-
-	err := shutdownHTTPServer(srv, testShutdownTimeout)
-
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("err = %v, want it to keep the graceful-shutdown failure", err)
-	}
-	if !errors.Is(err, closeErr) {
-		t.Errorf("err = %v, want it to include the forced-close failure", err)
-	}
-}
-
-func TestMain_SuperviseHTTPServer_ErrServerClosedAfterShutdownIsExpected(t *testing.T) {
-	rec := &shutdownRecorder{}
-	srv, serve, shutdownCtx := newGracefulStub(rec.add)
-
-	ctx, sendSignal := context.WithCancel(context.Background())
-
-	if err := superviseHTTPServer(ctx, srv, serve, testShutdownTimeout); err != nil {
-		t.Fatalf("http.ErrServerClosed after a requested shutdown must not be an error, got: %v", err)
-	}
-
-	requireEvents(t, rec.snapshot(), []string{"shutdown"})
-	shutdownCtx.requireFresh(t, "Shutdown", testShutdownTimeout)
-}
-
-func TestMain_SuperviseHTTPServer_ErrServerClosedWithoutShutdownIsUnexpected(t *testing.T) {
-	rec := &shutdownRecorder{}
-	srv, _, _ := newGracefulStub(rec.add)
-	serve := func() error { return http.ErrServerClosed }
-
-	err := superviseHTTPServer(context.Background(), srv, serve, testShutdownTimeout)
-
-	if !errors.Is(err, http.ErrServerClosed) {
-		t.Fatalf("err = %v, want the unrequested closure reported", err)
-	}
-}
-
-func TestMain_SuperviseHTTPServer_ServerErrorRacingSignalIsNotLost(t *testing.T) {
-	stopped := make(chan struct{})
-	srv := &stubHTTPServer{
-		shutdownFn: func(context.Context) error { close(stopped); return nil },
-		closeFn:    func() error { return nil },
-	}
-	serve := func() error {
-		<-stopped
-		return errSimulatedServerFailure
-	}
-
-	ctx, sendSignal := context.WithCancel(context.Background())
-	sendSignal()
-
-	err := superviseHTTPServer(ctx, srv, serve, testShutdownTimeout)
-
-	if !errors.Is(err, errSimulatedServerFailure) {
-		t.Fatalf("err = %v, want the genuine server error reported", err)
-	}
-}
-
-func TestMain_SuperviseHTTPServer_UnexpectedFailureIsReportedAndServerStopped(t *testing.T) {
-	rec := &shutdownRecorder{}
-	srv, _, shutdownCtx := newGracefulStub(rec.add)
-	serve := func() error { return errSimulatedServerFailure }
-
-	err := superviseHTTPServer(context.Background(), srv, serve, testShutdownTimeout)
-
-	if !errors.Is(err, errSimulatedServerFailure) {
-		t.Fatalf("err = %v, want the server failure propagated", err)
-	}
-
-	requireEvents(t, rec.snapshot(), []string{"shutdown"})
-	shutdownCtx.requireFresh(t, "Shutdown", testShutdownTimeout)
-}
-
-func TestMain_ServeUntilShutdown_SignalShutsDownThenDrains(t *testing.T) {
-	rec := &shutdownRecorder{}
-	srv, serve, _ := newGracefulStub(rec.add)
-
-	var drainCtx ctxSnapshot
-	drain := func(ctx context.Context) error {
-		drainCtx = snapshotCtx(ctx)
-		rec.add("drain")
-		return nil
-	}
-
-	ctx, sendSignal := context.WithCancel(context.Background())
-	sendSignal()
-
-	if code := serveUntilShutdown(ctx, srv, serve, testShutdownTimeout, drain); code != 0 {
-		t.Fatalf("exit code = %d, want 0 after a clean signal shutdown", code)
-	}
-
-	requireEvents(t, rec.snapshot(), []string{"shutdown", "drain"})
-	drainCtx.requireFresh(t, "telemetry drain", testDrainTimeout)
-}
-
-func TestMain_ServeUntilShutdown_DrainFailureDoesNotChangeExitCode(t *testing.T) {
-	rec := &shutdownRecorder{}
-	srv, serve, _ := newGracefulStub(rec.add)
-	drain := func(context.Context) error { return errors.New("collector unreachable") }
-
-	ctx, sendSignal := context.WithCancel(context.Background())
-	sendSignal()
-
-	if code := serveUntilShutdown(ctx, srv, serve, testShutdownTimeout, drain); code != 0 {
-		t.Fatalf("exit code = %d, want 0: an incomplete drain is only logged", code)
-	}
-}
-
-func failureScenario(emit func(string)) int {
-	defer emit("cleanup")
-
-	srv := &stubHTTPServer{
-		shutdownFn: func(context.Context) error { emit("shutdown"); return nil },
-		closeFn:    func() error { emit("close"); return nil },
-	}
-	serve := func() error { return errSimulatedServerFailure }
-	drain := func(context.Context) error { emit("drain"); return nil }
-
-	return serveUntilShutdown(context.Background(), srv, serve, testShutdownTimeout, drain)
-}
-
-func TestMain_ServeUntilShutdown_UnexpectedFailureCleansUpAndReturnsFailure(t *testing.T) {
-	rec := &shutdownRecorder{}
-
-	code := failureScenario(rec.add)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
-	}
-
-	requireEvents(t, rec.snapshot(), []string{"shutdown", "drain", "cleanup"})
-}
-
-func TestMain_ServeUntilShutdown_ListenFailureOnRealServer(t *testing.T) {
-	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	// Pass the same *sql.DB to GORM so both sqlc and GORM share one connection
+	// pool. Previously each opened its own *sql.DB, consuming up to 40
+	// Postgres connections. Now together they consume at most DBMaxOpenConns.
+	orm, err := database.NewGorm(db, cfg.Debug)
 	if err != nil {
-		t.Fatalf("listen: %v", err)
+		logrus.WithError(err).Fatal("Unable to open database with gorm")
 	}
-	defer occupied.Close()
 
-	srv := &http.Server{Addr: occupied.Addr().String(), Handler: http.NotFoundHandler()}
+	// Create a shared pgxpool for all pgvector stores so that each executor
+	// reuses pooled connections instead of opening a dedicated pgx.Connect.
+	pgPoolConfig, err := pgxpool.ParseConfig(boundedURL)
+	if err != nil {
+		logrus.WithError(err).Fatal("Failed to parse pgxpool config")
+	}
+	pgPoolConfig.MaxConns = int32(cfg.DBVectorMaxConns)
+	pgPool, err := pgxpool.NewWithConfig(ctx, pgPoolConfig)
+	if err != nil {
+		logrus.WithError(err).Fatal("Failed to create pgxpool")
+	}
+	defer pgPool.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), testWaitTimeout)
+	// Attach the live pool to the config so router and tool executors can use
+	// pgvector.WithConn(cfg.PgxPool) without any interface changes.
+	cfg.PgxPool = pgPool
+
+	goose.SetBaseFS(migrations.EmbedMigrations)
+
+	if err := goose.SetDialect("postgres"); err != nil {
+		logrus.WithError(err).Fatal("Database dialect configuration failed")
+	}
+
+	// goose's own queries are unqualified, so without this a fresh tenant
+	// schema silently inherits public's version table via search_path and
+	// skips its migrations. See pkg/database/tenant.go for the
+	// schema/search_path setup.
+	goose.SetTableName(cfg.SchemaName() + ".goose_db_version")
+
+	// Hold an advisory lock so simultaneous boots cannot execute the same
+	// migration set concurrently; the initial migration uses bare CREATE TABLE,
+	// so the loser would otherwise abort on "relation already exists".
+	// Migrations get a connection of their own, without the statement ceiling:
+	// one of them may legitimately run longer than any request would.
+	migrator, err := sql.Open("postgres", cfg.DatabaseURL)
+	if err != nil {
+		logrus.WithError(err).Fatal("Unable to open database for migrations")
+	}
+
+	migrationErr := database.RunMigrations(ctx, migrator, cfg, func(db *sql.DB) error {
+		return goose.Up(db, "sql")
+	})
+
+	if err := migrator.Close(); err != nil {
+		logrus.WithError(err).Warn("failed to close the migration connection")
+	}
+
+	if err := migrationErr; err != nil {
+		// Fatal: continuing on a half-migrated schema and then serving traffic is
+		// strictly worse than refusing to start.
+		logrus.WithError(err).Fatal("Schema migration execution failed")
+	}
+
+	logrus.Info("Database schema updated successfully")
+
+	// Keep the update service informed about this installation, periodically.
+	// After the migrations, deliberately: on a first boot the tables it reads do
+	// not exist until this point, and a summary of a schema that is not there yet
+	// describes an installation with nothing in it — which is also what an
+	// installation nobody uses looks like.
+	//
+	// A goroutine that owns nothing: it reads, it sends, and every failure along
+	// the way is a debug line. A server must not fail to start because something
+	// it only talks to is unreachable. What it learns is handed to the router, so
+	// the UI can show whether this build is current; nil means it never runs, and
+	// the UI says so.
+	var updates *update.Service
+	if built, err := update.New(cfg, queries); err != nil {
+		logrus.WithError(err).Debug("update service integration is not configured")
+	} else {
+		updates = built
+		go updates.Run(ctx)
+	}
+
+	if cfg.PprofAddr != "" {
+		go profiling.Start(cfg.PprofAddr)
+	}
+
+	client, err := docker.NewDockerClient(ctx, queries, cfg)
+	if err != nil {
+		logrus.WithError(err).Fatal("Docker runtime client initialization failed")
+	}
+
+	providers, err := providers.NewProviderController(cfg, queries, client)
+	if err != nil {
+		logrus.WithError(err).Fatal("LLM provider controller initialization failed")
+	}
+	subscriptions := subscriptions.NewSubscriptionsController()
+	controller := controller.NewFlowController(queries, cfg, client, providers, subscriptions)
+
+	if err := controller.LoadFlows(ctx); err != nil {
+		logrus.WithError(err).Fatal("Active flows restoration failed")
+	}
+
+	r := router.NewRouter(queries, orm, cfg, providers, controller, subscriptions, client, updates)
+
+	listen := net.JoinHostPort(cfg.ServerHost, strconv.Itoa(cfg.ServerPort))
+	srv := &http.Server{
+		Addr:              listen,
+		Handler:           r.Handler(),
+		ReadHeaderTimeout: router.ReadHeaderTimeout,
+		IdleTimeout:       router.IdleTimeout,
+	}
+
+	serve := func() error {
+		logrus.Infof("API server listening on %s", listen)
+
+		if cfg.ServerUseSSL && cfg.ServerSSLCrt != "" && cfg.ServerSSLKey != "" {
+			logrus.Info("Starting server with TLS enabled")
+			return srv.ListenAndServeTLS(cfg.ServerSSLCrt, cfg.ServerSSLKey)
+		}
+
+		logrus.Info("Starting server without TLS (HTTP only)")
+		return srv.ListenAndServe()
+	}
+
+	// Blocks until a shutdown signal or a server failure, then stops the HTTP
+	// server and drains telemetry. The exit code is returned rather than raised
+	// with Fatal so the deferred pool cleanup above still runs.
+	exitCode := serveUntilShutdown(ctx, srv, serve, httpShutdownTimeout, func(ctx context.Context) error {
+		return obs.Observer.Drain(ctx)
+	})
+
+	// On a server failure ctx is still live; cancel it so work bound to it (the
+	// update service, flows) stops before the deferred calls close the pools.
+	// Idempotent after a signal.
+	cancelOnSignal()
+
+	if exitCode == 0 {
+		logrus.Info("Application shutdown completed successfully")
+	}
+
+	return exitCode
+}
+
+// httpServer is the part of *http.Server the shutdown logic needs, so tests can
+// drive the deadline and failure paths without waiting on real timers.
+type httpServer interface {
+	Shutdown(ctx context.Context) error
+	Close() error
+}
+
+// serveUntilShutdown runs serve until ctx is cancelled or serve fails, stops the
+// HTTP server, and only then drains telemetry, so requests that finish during
+// graceful shutdown can still emit it. It returns the process exit code and
+// never exits itself, which keeps the caller's deferred cleanup reachable.
+func serveUntilShutdown(
+	ctx context.Context,
+	srv httpServer,
+	serve func() error,
+	shutdownTimeout time.Duration,
+	drain func(context.Context) error,
+) int {
+	err := superviseHTTPServer(ctx, srv, serve, shutdownTimeout)
+
+	drainTelemetry(drain)
+
+	if err != nil {
+		logrus.WithError(err).Error("HTTP server terminated with an error")
+		return 1
+	}
+
+	return 0
+}
+
+// superviseHTTPServer runs serve in the background and returns once the server
+// has been stopped. It returns nil only for a shutdown it requested itself and
+// that completed gracefully.
+func superviseHTTPServer(
+	ctx context.Context,
+	srv httpServer,
+	serve func() error,
+	shutdownTimeout time.Duration,
+) error {
+	// Buffered so the goroutine can always deliver its result and exit, even
+	// when nobody is left to receive it.
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- serve() }()
+
+	select {
+	case <-ctx.Done():
+		logrus.Warn("Shutdown signal received, cleaning up resources...")
+		shutdownErr := shutdownHTTPServer(srv, shutdownTimeout)
+
+		// Shutdown makes serve return http.ErrServerClosed. Wait for it so a real
+		// error that raced the signal is reported instead of lost.
+		var failure error
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			failure = fmt.Errorf("API server failed: %w", err)
+		}
+
+		return errors.Join(failure, shutdownErr)
+
+	case err := <-serveErr:
+		// Nobody asked the server to stop, so even http.ErrServerClosed or a nil
+		// return means it died on its own.
+		if err == nil {
+			err = errors.New("serve returned without an error")
+		}
+		failure := fmt.Errorf("API server failed: %w", err)
+
+		// Connections accepted before the failure are still being served; give
+		// them the same bounded shutdown before their resources are released.
+		return errors.Join(failure, shutdownHTTPServer(srv, shutdownTimeout))
+	}
+}
+
+// shutdownHTTPServer gracefully stops srv within timeout and force-closes what
+// remains if that fails. Shutdown does not wait for hijacked connections
+// (WebSockets), nor does it stop background services or running flows.
+func shutdownHTTPServer(srv httpServer, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	drained := false
-	drain := func(context.Context) error { drained = true; return nil }
-
-	code := serveUntilShutdown(ctx, srv, srv.ListenAndServe, testShutdownTimeout, drain)
-
-	if code != 1 {
-		t.Errorf("exit code = %d, want 1 when the address is already in use", code)
+	err := srv.Shutdown(ctx)
+	if err == nil {
+		return nil
 	}
-	if !drained {
-		t.Error("telemetry was not drained after the listener failed")
+
+	logrus.WithError(err).Warn("Graceful HTTP shutdown failed, closing remaining connections")
+	shutdownErr := fmt.Errorf("graceful HTTP shutdown: %w", err)
+
+	if closeErr := srv.Close(); closeErr != nil {
+		logrus.WithError(closeErr).Error("Forced HTTP server close failed")
+		return errors.Join(shutdownErr, fmt.Errorf("force close HTTP server: %w", closeErr))
 	}
+
+	return shutdownErr
 }
 
-const failureHelperEnv = "PENTAGI_TEST_SERVER_FAILURE_HELPER"
+// drainTelemetry flushes buffered telemetry on its own deadline. A failure is
+// only logged: losing a final batch must not change the exit status.
+func drainTelemetry(drain func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(context.Background(), telemetryDrainTimeout)
+	defer cancel()
 
-// Child process of TestMain_ServeUntilShutdown_UnexpectedFailureExitStatus.
-func TestMain_ServeUntilShutdown_FailureHelperProcess(t *testing.T) {
-	if os.Getenv(failureHelperEnv) != "1" {
-		t.Skip("helper process for TestMain_ServeUntilShutdown_UnexpectedFailureExitStatus")
+	if err := drain(ctx); err != nil {
+		logrus.WithError(err).Warn("Telemetry drain incomplete")
 	}
-
-	os.Exit(failureScenario(func(event string) { fmt.Println("EVENT:" + event) }))
-}
-
-// runApplication itself needs PostgreSQL and Docker, so a stand-in with the same shape runs instead.
-func TestMain_ServeUntilShutdown_UnexpectedFailureExitStatus(t *testing.T) {
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMain_ServeUntilShutdown_FailureHelperProcess$")
-	cmd.Env = append(os.Environ(), failureHelperEnv+"=1")
-
-	out, err := cmd.Output()
-
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		t.Fatalf("child err = %v, want a non-zero exit\nstdout:\n%s", err, out)
-	}
-	if got := exitErr.ExitCode(); got != 1 {
-		t.Fatalf("child exit status = %d, want 1\nstdout:\n%s\nstderr:\n%s", got, out, exitErr.Stderr)
-	}
-
-	var events []string
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSuffix(line, "\r")
-		if strings.HasPrefix(line, "EVENT:") {
-			events = append(events, strings.TrimPrefix(line, "EVENT:"))
-		}
-	}
-
-	requireEvents(t, events, []string{"shutdown", "drain", "cleanup"})
 }
